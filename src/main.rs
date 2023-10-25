@@ -1,3 +1,6 @@
+use std::path::Path;
+
+use db::diskmanager::DiskManager;
 fn main() {
-    println!("Hello, world!");
+    DiskManager::new(Path::new("test.db"));
 }
