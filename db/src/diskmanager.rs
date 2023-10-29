@@ -1,4 +1,4 @@
-use std::{fs::{File, self}, path::Path, io::{BufWriter, Write, Read, Seek, SeekFrom}};
+use std::{fs::{File, self}, path::Path, io::{Write, Read, Seek, SeekFrom}};
 
 type PageId = u64;
 type PageBuffer = [u8; PAGE_SIZE];
@@ -12,13 +12,13 @@ pub struct DiskManager {
     header: Option<HeaderPage>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct HeaderPage {
     free_page_id: PageId,
     num_pages: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct FreePage {
     next_free_page_id: PageId,
 }
@@ -31,15 +31,13 @@ impl DiskManager {
         } else {
             match fs::OpenOptions::new().read(true).write(true).create(true).open(path)  {
                 Ok(mut file) => {
-                    let mut writer = BufWriter::new(&mut file);
                     let mut buffer = [0; PAGE_SIZE];
                     copy_to_buffer(&HeaderPage {
                         free_page_id: 0,
                         num_pages: 0,
                     }, &mut buffer);
-                    writer.write(&mut buffer)?;
-                    writer.flush()?;
-                    drop(writer);
+                    file.write(&buffer)?;
+                    file.sync_data()?;
                     let mut disk_manager = Self { file, header: None };
                     disk_manager.append_free_pages(DEFAULT_FILE_NUM_PAGES - 1)?;
                     Ok(disk_manager)
@@ -51,24 +49,22 @@ impl DiskManager {
 
     fn append_free_pages(&mut self, num_pages: u64) -> std::io::Result<()> {
         let mut header = self.read_header_page()?;
-        let mut writer = BufWriter::new(&mut self.file);
         let mut buffer = [0; PAGE_SIZE];
         let mut page = FreePage { next_free_page_id: 0 };
         let mut last_page_id = header.free_page_id;
-        writer.seek(SeekFrom::End(0))?;
+
+        self.file.seek(SeekFrom::End(0))?;
         for i in 1..=num_pages {
             page.next_free_page_id = last_page_id;
             copy_to_buffer(&page, &mut buffer);
-            if writer.write(&mut buffer)? != buffer.len() {
-                panic!("Couldn't write more");
-            }
+            self.file.write(&buffer)?;
             last_page_id = header.free_page_id + i;
         }
+
         header.free_page_id = last_page_id;
         header.num_pages += num_pages;
-        writer.flush()?;
-        drop(writer);
-        self.write_header_page(header)?;
+        self.write_header_page(header)?;    // sync_data() is called here
+
         Ok(())
     }
 
@@ -90,29 +86,59 @@ impl DiskManager {
         }
     }
 
-    fn write_header_page(&mut self, header: HeaderPage) -> std::io::Result<usize> {
-        let mut buffer = [0u8; PAGE_SIZE];
-        copy_to_buffer(&header, &mut buffer);
+    fn write_header_page(&mut self, header: HeaderPage) -> std::io::Result<()> {
+        self.write_page(0, &header)?;
         self.header = Some(header);
-        self.write_page(0, &buffer)
+        Ok(())
     }
 
-    pub fn read_page(&mut self, id: PageId) -> std::io::Result<PageBuffer> {
+    pub fn read_page<T: Sized + Default>(&mut self, id: PageId) -> std::io::Result<T> {
         if id > self.read_header_page()?.num_pages {
             panic!("Invalid id is used");
         }
         let mut buffer = [0u8; PAGE_SIZE];
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.read(&mut buffer)?;
-        Ok(buffer)
+        let mut obj = T::default();
+        copy_to_obj(&buffer, &mut obj);
+        Ok(obj)
     }
 
-    pub fn write_page(&mut self, id: PageId, buffer: &PageBuffer) -> std::io::Result<usize> {
+    pub fn write_page<T: Sized>(&mut self, id: PageId, obj: &T) -> std::io::Result<()> {
         if id > self.read_header_page()?.num_pages {
             panic!("Invalid id is used");
         }
+        let mut buffer = [0u8; PAGE_SIZE];
+        copy_to_buffer(&obj, &mut buffer);
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
-        self.file.write(buffer)
+        self.file.write(&buffer)?;
+        self.file.sync_data()
+    }
+
+    pub fn alloc_page(&mut self) -> std::io::Result<PageId> {
+        let mut header = self.read_header_page()?;
+        if header.free_page_id == 0 {
+            self.append_free_pages(header.num_pages)?;
+            header = self.read_header_page()?;
+        }
+        let free_page_id = header.free_page_id;
+        let free_page = self.read_page::<FreePage>(free_page_id)?;
+        header.free_page_id = free_page.next_free_page_id;
+        self.write_header_page(header)?;
+        Ok(free_page_id)
+    }
+
+    pub fn free_page(&mut self, id: PageId) -> std::io::Result<()> {
+        let mut header = self.read_header_page()?;
+        if id > header.num_pages {
+            panic!("Invalid id is used");
+        }
+        let mut page = self.read_page::<FreePage>(id)?;
+        header.free_page_id = id;
+        page.next_free_page_id = header.free_page_id;
+        self.write_header_page(header)?;
+        self.write_page(id, &page)?;
+        Ok(())
     }
 }
 
