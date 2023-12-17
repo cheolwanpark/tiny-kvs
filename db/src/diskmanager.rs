@@ -1,24 +1,26 @@
 use std::{fs::{File, self}, path::Path, io::{Write, Read, Seek, SeekFrom}};
+use serde_derive::{Serialize as SerializeDerive, Deserialize as DeserializeDerive};
+use serde::{Serialize, de::DeserializeOwned};
+use bincode;
+use rand::prelude::*;
 
 type PageId = u64;
-type PageBuffer = [u8; PAGE_SIZE];
 
-const DEFAULT_FILE_SIZE: u64 = 1024*1024*10;
-const PAGE_SIZE: usize = 4096;
-const DEFAULT_FILE_NUM_PAGES: u64 = DEFAULT_FILE_SIZE / PAGE_SIZE as u64;
+pub const DEFAULT_FILE_SIZE: u64 = 1024*1024*10;
+pub const PAGE_SIZE: usize = 4096;
+pub const DEFAULT_FILE_NUM_PAGES: u64 = DEFAULT_FILE_SIZE / PAGE_SIZE as u64;
 
 pub struct DiskManager {
     file: File,
-    header: Option<HeaderPage>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, SerializeDerive, DeserializeDerive)]
 struct HeaderPage {
     free_page_id: PageId,
     num_pages: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, SerializeDerive, DeserializeDerive)]
 struct FreePage {
     next_free_page_id: PageId,
 }
@@ -27,16 +29,16 @@ impl DiskManager {
     pub fn new(path: &Path) -> std::io::Result<Self> {
         if path.exists() {
             let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
-            Ok(Self { file, header: None })
+            Ok(Self { file })
         } else {
             match fs::OpenOptions::new().read(true).write(true).create(true).open(path)  {
                 Ok(file) => {
-                    let header = HeaderPage {
+                    let mut disk_manager = Self { file };
+                    disk_manager.write_header_page(HeaderPage {
                         free_page_id: 0,
                         num_pages: 0,
-                    };
-                    let mut disk_manager = Self { file, header: Some(header) };
-                    disk_manager.append_free_pages(DEFAULT_FILE_NUM_PAGES - 1)?;    // header page is written here
+                    })?;
+                    disk_manager.append_free_pages(DEFAULT_FILE_NUM_PAGES - 1)?;
                     Ok(disk_manager)
                 },
                 Err(reason) => panic!("Couldn't create {} : {}", path.display(), reason)
@@ -53,72 +55,56 @@ impl DiskManager {
         self.file.seek(SeekFrom::End(0))?;
         for i in 1..=num_pages {
             page.next_free_page_id = last_page_id;
-            copy_to_buffer(&page, &mut buffer);
+            bincode::serialize_into(&mut buffer.as_mut_slice(), &page).unwrap();
             self.file.write(&buffer)?;
             last_page_id = header.free_page_id + i;
         }
 
         header.free_page_id = last_page_id;
         header.num_pages += num_pages;
-        self.write_header_page(header)?;    // sync_data() is called here
-
-        Ok(())
+        self.write_header_page(header)
     }
 
     fn read_header_page(&mut self) -> std::io::Result<HeaderPage> {
-        match self.header.clone() {
-            Some(header) => Ok(header),
-            None => {
-                let mut buffer = [0u8; PAGE_SIZE];
-                self.file.rewind()?;
-                self.file.read(&mut buffer)?;
-                let mut header = HeaderPage {
-                    free_page_id: 0,
-                    num_pages: 0
-                };
-                copy_to_obj(&buffer, &mut header);
-                self.header = Some(header.clone());
-                Ok(header)
-            }
-        }
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        self.file.rewind()?;
+        self.file.read_exact(buffer.as_mut_slice())?;
+        Ok(bincode::deserialize(&buffer).unwrap())
     }
 
     fn write_header_page(&mut self, header: HeaderPage) -> std::io::Result<()> {
-        self.write_page(0, &header)?;
-        self.header = Some(header);
-        Ok(())
+        self.write_header_page_nosync(header)?;
+        self.file.sync_data()
     }
 
-    fn write_header_page_nosync(&mut self, header: HeaderPage) -> std::io::Result<()> {
-        self.write_page_nosync(0, &header)?;
-        self.header = Some(header);
-        Ok(())
-    
+    fn write_header_page_nosync(&mut self, header: HeaderPage) -> std::io::Result<usize> {
+        let mut buffer = [0u8; PAGE_SIZE];
+        bincode::serialize_into(&mut buffer.as_mut_slice(), &header).unwrap();
+        self.file.rewind()?;
+        self.file.write(&buffer)
     }
 
-    pub fn read_page<T: Sized + Default>(&mut self, id: PageId) -> std::io::Result<T> {
+    pub fn read_page<T: DeserializeOwned + Sized>(&mut self, id: PageId) -> std::io::Result<T> {
         if id > self.read_header_page()?.num_pages {
             panic!("Invalid id is used");
         }
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = vec![0u8; PAGE_SIZE];
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
-        self.file.read(&mut buffer)?;
-        let mut obj = T::default();
-        copy_to_obj(&buffer, &mut obj);
-        Ok(obj)
+        self.file.read_exact(buffer.as_mut_slice())?;
+        Ok(bincode::deserialize(&buffer).unwrap())
     }
 
-    pub fn write_page<T: Sized>(&mut self, id: PageId, obj: &T) -> std::io::Result<()> {
+    pub fn write_page<T: Serialize>(&mut self, id: PageId, obj: &T) -> std::io::Result<()> {
         self.write_page_nosync(id, obj)?;
         self.file.sync_data()
     }
 
-    fn write_page_nosync<T: Sized>(&mut self, id: PageId, obj: &T) -> std::io::Result<usize> {
+    fn write_page_nosync<T: Serialize>(&mut self, id: PageId, obj: &T) -> std::io::Result<usize> {
         if id > self.read_header_page()?.num_pages {
             panic!("Invalid id is used");
         }
         let mut buffer = [0u8; PAGE_SIZE];
-        copy_to_buffer(&obj, &mut buffer);
+        bincode::serialize_into(&mut buffer.as_mut_slice(), &obj).unwrap();
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.write(&buffer)
     }
@@ -141,33 +127,103 @@ impl DiskManager {
         if id > header.num_pages {
             panic!("Invalid id is used");
         }
-        let mut page = self.read_page::<FreePage>(id)?;
+        let page = FreePage { next_free_page_id: header.free_page_id };
         header.free_page_id = id;
-        page.next_free_page_id = header.free_page_id;
         self.write_header_page_nosync(header)?;
         self.write_page(id, &page)?;
         Ok(())
     }
 }
 
-fn copy_to_buffer<T: Sized>(obj: &T, buffer: &mut PageBuffer) {
-    let obj_slice;
-    unsafe {
-        obj_slice = core::slice::from_raw_parts(
-            (obj as *const T) as *const u8,
-            core::mem::size_of::<T>(),
-        );
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    struct CleanupFileGuard<'a> {
+        path: &'a Path,
     }
-    buffer[..obj_slice.len()].copy_from_slice(obj_slice);
+    
+    impl<'a> Drop for CleanupFileGuard<'a> {
+        fn drop(&mut self) {
+            fs::remove_file(self.path).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_new() {
+        let filename = "test_new.db";
+        let _guard = CleanupFileGuard{ path: Path::new(filename)};
+
+        let path = Path::new(filename);
+        let _ = DiskManager::new(&path);
+
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(metadata.len(), DEFAULT_FILE_SIZE);
+    }
+
+    #[test]
+    fn test_alloc_and_free_pages() {
+        let filename = "test_alloc_and_free_pages.db";
+        let _guard = CleanupFileGuard{ path: Path::new(filename)};
+
+        let path = Path::new(filename);
+        let mut disk_manager = DiskManager::new(&path).unwrap();
+
+        let free_page_id = disk_manager.alloc_page().unwrap();
+        let allocated_page_id = disk_manager.alloc_page().unwrap();
+        disk_manager.free_page(free_page_id).unwrap();
+
+        let header = disk_manager.read_header_page().unwrap();
+        let mut cur_free_page_id = header.free_page_id;
+        let mut free_page_id_exist = false;
+        while cur_free_page_id != 0 {
+            assert_ne!(cur_free_page_id, allocated_page_id);
+            if cur_free_page_id == free_page_id {
+                free_page_id_exist = true;
+            }
+            let free_page = disk_manager.read_page::<FreePage>(cur_free_page_id).unwrap();
+            cur_free_page_id = free_page.next_free_page_id;
+        }
+        assert!(free_page_id_exist);
+    }
+
+#[test]
+fn test_write_and_read_page() {
+    let filename = "test_write_and_read_page.db";
+    let _guard = CleanupFileGuard { path: Path::new(filename) };
+
+    let path = Path::new(filename);
+    let mut disk_manager = DiskManager::new(&path).unwrap();
+
+    let page_id = disk_manager.alloc_page().unwrap();
+    let mut rng = rand::thread_rng();
+    let data: Vec<u8> = (0..PAGE_SIZE/2).map(|_| rng.sample(rand::distributions::Alphanumeric) as u8).collect();
+    disk_manager.write_page(page_id, &data).unwrap();
+
+    let read_data = disk_manager.read_page::<Vec<u8>>(page_id).unwrap();
+    assert_eq!(read_data, data);
 }
 
-fn copy_to_obj<T: Sized>(buffer: &PageBuffer, obj: &mut T) {
-    let obj_slice;
-    unsafe {
-        obj_slice = core::slice::from_raw_parts_mut(
-            (obj as *mut T) as *mut u8,
-            core::mem::size_of::<T>(),
-        );
+    #[test]
+    #[ignore]
+    fn test_db_growing() {
+        let filename = "test_db_growing.db";
+        let _guard = CleanupFileGuard{ path: Path::new(filename)};
+
+        let path = Path::new(filename);
+        let mut disk_manager = DiskManager::new(&path).unwrap();
+
+        for _ in 0..DEFAULT_FILE_NUM_PAGES {
+            disk_manager.alloc_page().unwrap();
+        }
+
+        // num_pages should be doubled
+        // num_pages is DEFAULT_FILE_NUM_PAGES - 1 when db is created (first page is header)
+        // after grow, num_pages should be (DEFAULT_FILE_NUM_PAGES - 1) * 2
+        // and file size should be (DEFAULT_FILE_NUM_PAGES - 1) * 2 * PAGE_SIZE including header page
+        let expected_size = (DEFAULT_FILE_NUM_PAGES * 2 - 1) * PAGE_SIZE as u64;
+
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(metadata.len(), expected_size);
     }
-    obj_slice.copy_from_slice(&buffer[..obj_slice.len()]);
 }
