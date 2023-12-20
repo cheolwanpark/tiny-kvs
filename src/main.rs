@@ -1,6 +1,6 @@
 use std::path::Path;
+use db::pagemanager::DiskBasedPageManager;
 
-use db::diskmanager::DiskManager;
 fn main() {
-    let _ = DiskManager::new(Path::new("test.db")).unwrap();
+    let _ = DiskBasedPageManager::new(Path::new("test.db")).unwrap();
 }
