@@ -2,17 +2,13 @@ use std::{fs::{File, self}, path::Path, io::{Write, Read, Seek, SeekFrom}};
 use serde_derive::{Serialize as SerializeDerive, Deserialize as DeserializeDerive};
 use serde::{Serialize, de::DeserializeOwned};
 use bincode;
-use rand::prelude::*;
-
-type PageId = u64;
+#[allow(unused_imports)]
+use rand::Rng;
+use super::*;
 
 pub const DEFAULT_FILE_SIZE: u64 = 1024*1024*10;
 pub const PAGE_SIZE: usize = 4096;
 pub const DEFAULT_FILE_NUM_PAGES: u64 = DEFAULT_FILE_SIZE / PAGE_SIZE as u64;
-
-pub struct DiskManager {
-    file: File,
-}
 
 #[derive(Clone, Default, SerializeDerive, DeserializeDerive)]
 struct HeaderPage {
@@ -25,7 +21,53 @@ struct FreePage {
     next_free_page_id: PageId,
 }
 
-impl DiskManager {
+pub struct DiskBasedPageManager {
+    file: File,
+}
+
+impl PageManager for DiskBasedPageManager {
+    fn read_page<T: DeserializeOwned + Sized>(&mut self, id: PageId) -> std::io::Result<T> {
+        if id > self.read_header_page()?.num_pages {
+            panic!("Invalid id is used");
+        }
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
+        self.file.read_exact(buffer.as_mut_slice())?;
+        Ok(bincode::deserialize(&buffer).unwrap())
+    }
+
+    fn write_page<T: Serialize>(&mut self, id: PageId, obj: &T) -> std::io::Result<()> {
+        self.write_page_nosync(id, obj)?;
+        self.file.sync_data()
+    }
+
+    fn alloc_page(&mut self) -> std::io::Result<PageId> {
+        let mut header = self.read_header_page()?;
+        if header.free_page_id == 0 {
+            self.append_free_pages(header.num_pages)?;
+            header = self.read_header_page()?;
+        }
+        let free_page_id = header.free_page_id;
+        let free_page = self.read_page::<FreePage>(free_page_id)?;
+        header.free_page_id = free_page.next_free_page_id;
+        self.write_header_page(header)?;
+        Ok(free_page_id)
+    }
+
+    fn free_page(&mut self, id: PageId) -> std::io::Result<()> {
+        let mut header = self.read_header_page()?;
+        if id > header.num_pages {
+            panic!("Invalid id is used");
+        }
+        let page = FreePage { next_free_page_id: header.free_page_id };
+        header.free_page_id = id;
+        self.write_header_page_nosync(header)?;
+        self.write_page(id, &page)?;
+        Ok(())
+    }
+}
+
+impl DiskBasedPageManager {
     pub fn new(path: &Path) -> std::io::Result<Self> {
         if path.exists() {
             let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
@@ -84,21 +126,6 @@ impl DiskManager {
         self.file.write(&buffer)
     }
 
-    pub fn read_page<T: DeserializeOwned + Sized>(&mut self, id: PageId) -> std::io::Result<T> {
-        if id > self.read_header_page()?.num_pages {
-            panic!("Invalid id is used");
-        }
-        let mut buffer = vec![0u8; PAGE_SIZE];
-        self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
-        self.file.read_exact(buffer.as_mut_slice())?;
-        Ok(bincode::deserialize(&buffer).unwrap())
-    }
-
-    pub fn write_page<T: Serialize>(&mut self, id: PageId, obj: &T) -> std::io::Result<()> {
-        self.write_page_nosync(id, obj)?;
-        self.file.sync_data()
-    }
-
     fn write_page_nosync<T: Serialize>(&mut self, id: PageId, obj: &T) -> std::io::Result<usize> {
         if id > self.read_header_page()?.num_pages {
             panic!("Invalid id is used");
@@ -107,31 +134,6 @@ impl DiskManager {
         bincode::serialize_into(&mut buffer.as_mut_slice(), &obj).unwrap();
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.write(&buffer)
-    }
-
-    pub fn alloc_page(&mut self) -> std::io::Result<PageId> {
-        let mut header = self.read_header_page()?;
-        if header.free_page_id == 0 {
-            self.append_free_pages(header.num_pages)?;
-            header = self.read_header_page()?;
-        }
-        let free_page_id = header.free_page_id;
-        let free_page = self.read_page::<FreePage>(free_page_id)?;
-        header.free_page_id = free_page.next_free_page_id;
-        self.write_header_page(header)?;
-        Ok(free_page_id)
-    }
-
-    pub fn free_page(&mut self, id: PageId) -> std::io::Result<()> {
-        let mut header = self.read_header_page()?;
-        if id > header.num_pages {
-            panic!("Invalid id is used");
-        }
-        let page = FreePage { next_free_page_id: header.free_page_id };
-        header.free_page_id = id;
-        self.write_header_page_nosync(header)?;
-        self.write_page(id, &page)?;
-        Ok(())
     }
 }
 
@@ -155,7 +157,7 @@ mod test {
         let _guard = CleanupFileGuard{ path: Path::new(filename)};
 
         let path = Path::new(filename);
-        let _ = DiskManager::new(&path);
+        let _ = DiskBasedPageManager::new(&path);
 
         let metadata = fs::metadata(path).unwrap();
         assert_eq!(metadata.len(), DEFAULT_FILE_SIZE);
@@ -167,7 +169,7 @@ mod test {
         let _guard = CleanupFileGuard{ path: Path::new(filename)};
 
         let path = Path::new(filename);
-        let mut disk_manager = DiskManager::new(&path).unwrap();
+        let mut disk_manager = DiskBasedPageManager::new(&path).unwrap();
 
         let free_page_id = disk_manager.alloc_page().unwrap();
         let allocated_page_id = disk_manager.alloc_page().unwrap();
@@ -193,7 +195,7 @@ fn test_write_and_read_page() {
     let _guard = CleanupFileGuard { path: Path::new(filename) };
 
     let path = Path::new(filename);
-    let mut disk_manager = DiskManager::new(&path).unwrap();
+    let mut disk_manager = DiskBasedPageManager::new(&path).unwrap();
 
     let page_id = disk_manager.alloc_page().unwrap();
     let mut rng = rand::thread_rng();
@@ -211,7 +213,7 @@ fn test_write_and_read_page() {
         let _guard = CleanupFileGuard{ path: Path::new(filename)};
 
         let path = Path::new(filename);
-        let mut disk_manager = DiskManager::new(&path).unwrap();
+        let mut disk_manager = DiskBasedPageManager::new(&path).unwrap();
 
         for _ in 0..DEFAULT_FILE_NUM_PAGES {
             disk_manager.alloc_page().unwrap();
