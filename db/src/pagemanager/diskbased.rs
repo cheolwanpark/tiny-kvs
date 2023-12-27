@@ -189,22 +189,22 @@ mod test {
         assert!(free_page_id_exist);
     }
 
-#[test]
-fn test_write_and_read_page() {
-    let filename = "test_write_and_read_page.db";
-    let _guard = CleanupFileGuard { path: Path::new(filename) };
+    #[test]
+    fn test_write_and_read_page() {
+        let filename = "test_write_and_read_page.db";
+        let _guard = CleanupFileGuard { path: Path::new(filename) };
 
-    let path = Path::new(filename);
-    let mut disk_manager = DiskBasedPageManager::new(&path).unwrap();
+        let path = Path::new(filename);
+        let mut disk_manager = DiskBasedPageManager::new(&path).unwrap();
 
-    let page_id = disk_manager.alloc_page().unwrap();
-    let mut rng = rand::thread_rng();
-    let data: Vec<u8> = (0..PAGE_SIZE/2).map(|_| rng.sample(rand::distributions::Alphanumeric) as u8).collect();
-    disk_manager.write_page(page_id, &data).unwrap();
+        let page_id = disk_manager.alloc_page().unwrap();
+        let mut rng = rand::thread_rng();
+        let data: Vec<u8> = (0..PAGE_SIZE/2).map(|_| rng.sample(rand::distributions::Alphanumeric) as u8).collect();
+        disk_manager.write_page(page_id, &data).unwrap();
 
-    let read_data = disk_manager.read_page::<Vec<u8>>(page_id).unwrap();
-    assert_eq!(read_data, data);
-}
+        let read_data = disk_manager.read_page::<Vec<u8>>(page_id).unwrap();
+        assert_eq!(read_data, data);
+    }
 
     #[test]
     #[ignore]
