@@ -26,7 +26,7 @@ pub struct DiskBasedPageManager {
 }
 
 impl PageManager for DiskBasedPageManager {
-    fn read_page<T: DeserializeOwned + Sized>(&mut self, id: PageId) -> std::io::Result<T> {
+    fn read_page<T: DeserializeOwned>(&mut self, id: PageId) -> std::io::Result<T> {
         if id > self.read_header_page()?.num_pages {
             panic!("Invalid id is used");
         }
