@@ -1,5 +1,6 @@
 use serde::{Serialize, de::DeserializeOwned};
 
+pub const PAGE_SIZE: usize = 4096;
 pub type PageId = u64;
 
 pub trait PageManager {

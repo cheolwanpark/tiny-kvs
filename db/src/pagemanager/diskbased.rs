@@ -7,7 +7,6 @@ use rand::Rng;
 use super::*;
 
 pub const DEFAULT_FILE_SIZE: u64 = 1024*1024*10;
-pub const PAGE_SIZE: usize = 4096;
 pub const DEFAULT_FILE_NUM_PAGES: u64 = DEFAULT_FILE_SIZE / PAGE_SIZE as u64;
 
 #[derive(Clone, Default, SerializeDerive, DeserializeDerive)]
