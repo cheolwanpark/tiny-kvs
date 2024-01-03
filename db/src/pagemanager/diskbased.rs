@@ -1,6 +1,5 @@
-use std::{fs::{File, self}, path::Path, io::{Write, Read, Seek, SeekFrom}};
+use std::{fs::{File, self}, path::Path, io::{Write, Read, Seek, SeekFrom}, cell::RefCell};
 use serde_derive::{Serialize as SerializeDerive, Deserialize as DeserializeDerive};
-use serde::{Serialize, de::DeserializeOwned};
 use bincode;
 #[allow(unused_imports)]
 use rand::Rng;
@@ -24,19 +23,41 @@ pub struct DiskBasedPageManager {
     file: File,
 }
 
+struct PageAccessorImpl {
+    id: PageId,
+    data: RefCell<Vec<u8>>,
+}
+
+impl PageAccessor for PageAccessorImpl {
+    fn id(&self) -> PageId {
+        self.id
+    }
+
+    fn size(&self) -> usize {
+        self.data.borrow().len()
+    }
+
+    fn data(&self) -> Ref<Vec<u8>> {
+        self.data.borrow()
+    }
+}
+
 impl PageManager for DiskBasedPageManager {
-    fn read_page<T: DeserializeOwned>(&mut self, id: PageId) -> std::io::Result<T> {
+    fn read_page(&mut self, id: PageId) -> std::io::Result<Box<dyn PageAccessor>> {
         if id > self.read_header_page()?.num_pages {
             panic!("Invalid id is used");
         }
         let mut buffer = vec![0u8; PAGE_SIZE];
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
         self.file.read_exact(buffer.as_mut_slice())?;
-        Ok(bincode::deserialize(&buffer).unwrap())
+        Ok(Box::new(PageAccessorImpl {
+            id,
+            data: RefCell::new(buffer),
+        }))
     }
 
-    fn write_page<T: Serialize>(&mut self, id: PageId, obj: &T) -> std::io::Result<()> {
-        self.write_page_nosync(id, obj)?;
+    fn write_page(&mut self, page: Box<dyn PageAccessor>) -> std::io::Result<()> {
+        self.write_page_nosync(page)?;
         self.file.sync_data()
     }
 
@@ -47,7 +68,8 @@ impl PageManager for DiskBasedPageManager {
             header = self.read_header_page()?;
         }
         let free_page_id = header.free_page_id;
-        let free_page = self.read_page::<FreePage>(free_page_id)?;
+        let free_page = self.read_page(free_page_id)?;
+        let free_page: FreePage = from_page(free_page);
         header.free_page_id = free_page.next_free_page_id;
         self.write_header_page(header)?;
         Ok(free_page_id)
@@ -61,7 +83,7 @@ impl PageManager for DiskBasedPageManager {
         let page = FreePage { next_free_page_id: header.free_page_id };
         header.free_page_id = id;
         self.write_header_page_nosync(header)?;
-        self.write_page(id, &page)?;
+        self.write_page(into_page(id, &page))?;
         Ok(())
     }
 }
@@ -125,14 +147,12 @@ impl DiskBasedPageManager {
         self.file.write(&buffer)
     }
 
-    fn write_page_nosync<T: Serialize>(&mut self, id: PageId, obj: &T) -> std::io::Result<usize> {
-        if id > self.read_header_page()?.num_pages {
+    fn write_page_nosync(&mut self, page: Box<dyn PageAccessor>) -> std::io::Result<usize> {
+        if page.id() > self.read_header_page()?.num_pages {
             panic!("Invalid id is used");
         }
-        let mut buffer = [0u8; PAGE_SIZE];
-        bincode::serialize_into(&mut buffer.as_mut_slice(), &obj).unwrap();
-        self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
-        self.file.write(&buffer)
+        self.file.seek(SeekFrom::Start(page.id() * PAGE_SIZE as u64))?;
+        self.file.write(&page.data())
     }
 }
 
@@ -182,7 +202,7 @@ mod test {
             if cur_free_page_id == free_page_id {
                 free_page_id_exist = true;
             }
-            let free_page = disk_manager.read_page::<FreePage>(cur_free_page_id).unwrap();
+            let free_page: FreePage = from_page(disk_manager.read_page(cur_free_page_id).unwrap());
             cur_free_page_id = free_page.next_free_page_id;
         }
         assert!(free_page_id_exist);
@@ -198,11 +218,11 @@ mod test {
 
         let page_id = disk_manager.alloc_page().unwrap();
         let mut rng = rand::thread_rng();
-        let data: Vec<u8> = (0..PAGE_SIZE/2).map(|_| rng.sample(rand::distributions::Alphanumeric) as u8).collect();
-        disk_manager.write_page(page_id, &data).unwrap();
+        let data: Vec<u8> = (0..PAGE_SIZE).map(|_| rng.sample(rand::distributions::Alphanumeric) as u8).collect();
+        disk_manager.write_page(bytes_into_page(page_id, data.clone())).unwrap();
 
-        let read_data = disk_manager.read_page::<Vec<u8>>(page_id).unwrap();
-        assert_eq!(read_data, data);
+        let read_page = disk_manager.read_page(page_id).unwrap();
+        assert_eq!(read_page.data()[..], data[..]);
     }
 
     #[test]

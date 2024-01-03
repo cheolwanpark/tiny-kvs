@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc, cell::RefCell};
 use super::*;
 
 pub struct InMemoryPageManager<T: PageManager> {
@@ -11,10 +11,29 @@ pub struct InMemoryPageManager<T: PageManager> {
 #[derive(Clone)]
 struct PageFrame {
     page_id: PageId,
-    data: Vec<u8>,
+    data: Rc<RefCell<Vec<u8>>>,
     pin_count: u32,
     is_dirty: bool,
     ref_bit: bool,
+}
+
+struct PageAccessorImpl {
+    id: PageId,
+    data: Rc<RefCell<Vec<u8>>>,
+}
+
+impl PageAccessor for PageAccessorImpl {
+    fn id(&self) -> PageId {
+        self.id
+    }
+
+    fn size(&self) -> usize {
+        self.data.borrow().len()
+    }
+
+    fn data(&self) -> Ref<Vec<u8>> {
+        self.data.borrow()
+    }
 }
 
 impl<P: PageManager> InMemoryPageManager<P> {
@@ -24,7 +43,7 @@ impl<P: PageManager> InMemoryPageManager<P> {
             frame_map: HashMap::new(),
             frames: vec![PageFrame {
                 page_id: 0,
-                data: vec![0; PAGE_SIZE],
+                data: Rc::new(RefCell::new(vec![0; PAGE_SIZE])),
                 pin_count: 0,
                 is_dirty: false,
                 ref_bit: false,
@@ -70,7 +89,7 @@ impl<P: PageManager> InMemoryPageManager<P> {
             panic!("Page is pinned");
         }
         if frame.is_dirty {
-            self.page_manager.write_page(frame.page_id, &frame.data).unwrap();
+            self.page_manager.write_page(bytes_into_page(frame.page_id, frame.data.borrow().clone())).unwrap();
             frame.is_dirty = false;
         }
         self.frame_map.remove(&frame.page_id);
@@ -78,7 +97,7 @@ impl<P: PageManager> InMemoryPageManager<P> {
 }
 
 impl<P: PageManager> PageManager for InMemoryPageManager<P> {
-    fn read_page<T: DeserializeOwned>(&mut self, id: PageId) -> std::io::Result<T> {
+    fn read_page(&mut self, id: PageId) -> std::io::Result<Box<dyn PageAccessor>> {
         let frame = match self.get_frame(id) {
             Some(frame) => frame,
             None => {
@@ -86,9 +105,9 @@ impl<P: PageManager> PageManager for InMemoryPageManager<P> {
                 self.evict_page(victim_idx);
                 let frame = &mut self.frames[victim_idx];
 
-                let data: [u8; PAGE_SIZE] = self.page_manager.read_page(id)?;
+                let page = self.page_manager.read_page(id)?;
                 frame.page_id = id;
-                frame.data.copy_from_slice(&data);
+                frame.data.borrow_mut().copy_from_slice(&page.data());
                 frame.pin_count = 0;
                 frame.is_dirty = false;
                 self.frame_map.insert(id, victim_idx);
@@ -97,22 +116,25 @@ impl<P: PageManager> PageManager for InMemoryPageManager<P> {
         };
         frame.pin_count += 1;
         frame.ref_bit = true;
-        Ok(bincode::deserialize(&frame.data).unwrap())
+        Ok(Box::new(PageAccessorImpl {
+            id,
+            data: frame.data.clone(),
+        }))
     }
 
-    fn write_page<T: Serialize>(&mut self, id: PageId, obj: &T) -> std::io::Result<()> {
-        let frame = match self.get_frame(id) {
+    fn write_page(&mut self, page: Box<dyn PageAccessor>) -> std::io::Result<()> {
+        let frame = match self.get_frame(page.id()) {
             Some(frame) => frame,
             None => {
                 let victim_idx = self.find_victim();
                 self.evict_page(victim_idx);
                 let frame = &mut self.frames[victim_idx];
-                frame.page_id = id;
+                frame.page_id = page.id();
                 frame.pin_count = 0;
                 frame
             }
         };
-        bincode::serialize_into(&mut frame.data, obj).unwrap();
+        frame.data.borrow_mut().copy_from_slice(&page.data());
         frame.is_dirty = true;
         Ok(())
     }
@@ -127,9 +149,11 @@ impl<P: PageManager> PageManager for InMemoryPageManager<P> {
 }
 
 mod test {
-    use super::*;
     use std::{path::Path, fs};
+    #[allow(unused_imports)]
     use rand::Rng;
+    #[allow(unused_imports)]
+    use super::*;
 
     struct CleanupFileGuard<'a> {
         path: &'a Path,
@@ -155,10 +179,10 @@ mod test {
 
         let page_id = disk_manager.alloc_page().unwrap();
         let mut rng = rand::thread_rng();
-        let data: Vec<u8> = (0..PAGE_SIZE/2).map(|_| rng.sample(rand::distributions::Alphanumeric) as u8).collect();
-        disk_manager.write_page(page_id, &data).unwrap();
+        let data: Vec<u8> = (0..PAGE_SIZE).map(|_| rng.sample(rand::distributions::Alphanumeric) as u8).collect();
+        disk_manager.write_page(bytes_into_page(page_id, data.clone())).unwrap();
 
-        let read_data = disk_manager.read_page::<Vec<u8>>(page_id).unwrap();
-        assert_eq!(read_data, data);
+        let read_page = disk_manager.read_page(page_id).unwrap();
+        assert_eq!(read_page.data()[..], data[..]);
     }
 }
