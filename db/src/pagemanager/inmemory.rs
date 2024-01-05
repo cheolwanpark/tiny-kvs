@@ -60,7 +60,7 @@ impl<P: PageManager> InMemoryPageManager<P> {
         }
     }
 
-    fn find_victim(&mut self) -> usize {
+    fn find_victim(&mut self) -> Result<usize> {
         let start_idx = self.clock_hand;
         let mut second_loop = false;
         loop {
@@ -69,13 +69,13 @@ impl<P: PageManager> InMemoryPageManager<P> {
                 if frame.ref_bit {
                     frame.ref_bit = false;
                 } else {
-                    return self.clock_hand;
+                    return Ok(self.clock_hand);
                 }
             }
             self.clock_hand = (self.clock_hand + 1) % self.frames.len();
             if self.clock_hand == start_idx {
                 if second_loop {
-                    panic!("All pages are pinned");
+                    return Err(PageManagerError::AllPagesArePinned);
                 } else {
                     second_loop = true;
                 }
@@ -83,26 +83,27 @@ impl<P: PageManager> InMemoryPageManager<P> {
         }
     }
 
-    fn evict_page(&mut self, idx: usize) {
+    fn evict_page(&mut self, idx: usize) -> Result<()> {
         let frame = &mut self.frames[idx];
         if frame.pin_count > 0 {
-            panic!("Page is pinned");
+            return Err(PageManagerError::TryToEvictPinnedPage(frame.page_id));
         }
         if frame.is_dirty {
             self.page_manager.write_page(bytes_into_page(frame.page_id, frame.data.borrow().clone())).unwrap();
             frame.is_dirty = false;
         }
         self.frame_map.remove(&frame.page_id);
+        Ok(())
     }
 }
 
 impl<P: PageManager> PageManager for InMemoryPageManager<P> {
-    fn read_page(&mut self, id: PageId) -> std::io::Result<Box<dyn PageAccessor>> {
+    fn read_page(&mut self, id: PageId) -> Result<Box<dyn PageAccessor>> {
         let frame = match self.get_frame(id) {
             Some(frame) => frame,
             None => {
-                let victim_idx = self.find_victim();
-                self.evict_page(victim_idx);
+                let victim_idx = self.find_victim()?;
+                self.evict_page(victim_idx)?;
                 let frame = &mut self.frames[victim_idx];
 
                 let page = self.page_manager.read_page(id)?;
@@ -122,12 +123,12 @@ impl<P: PageManager> PageManager for InMemoryPageManager<P> {
         }))
     }
 
-    fn write_page(&mut self, page: Box<dyn PageAccessor>) -> std::io::Result<()> {
+    fn write_page(&mut self, page: Box<dyn PageAccessor>) -> Result<()> {
         let frame = match self.get_frame(page.id()) {
             Some(frame) => frame,
             None => {
-                let victim_idx = self.find_victim();
-                self.evict_page(victim_idx);
+                let victim_idx = self.find_victim()?;
+                self.evict_page(victim_idx)?;
                 let frame = &mut self.frames[victim_idx];
                 frame.page_id = page.id();
                 frame.pin_count = 0;
@@ -139,11 +140,11 @@ impl<P: PageManager> PageManager for InMemoryPageManager<P> {
         Ok(())
     }
 
-    fn alloc_page(&mut self) -> std::io::Result<PageId> {
+    fn alloc_page(&mut self) -> Result<PageId> {
         self.page_manager.alloc_page()
     }
 
-    fn free_page(&mut self, id: PageId) -> std::io::Result<()> {
+    fn free_page(&mut self, id: PageId) -> Result<()> {
         self.page_manager.free_page(id)
     }
 }

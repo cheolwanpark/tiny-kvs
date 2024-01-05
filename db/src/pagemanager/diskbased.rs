@@ -43,9 +43,9 @@ impl PageAccessor for PageAccessorImpl {
 }
 
 impl PageManager for DiskBasedPageManager {
-    fn read_page(&mut self, id: PageId) -> std::io::Result<Box<dyn PageAccessor>> {
+    fn read_page(&mut self, id: PageId) -> Result<Box<dyn PageAccessor>> {
         if id > self.read_header_page()?.num_pages {
-            panic!("Invalid id is used");
+            return Err(PageManagerError::InvalidPageId(id));
         }
         let mut buffer = vec![0u8; PAGE_SIZE];
         self.file.seek(SeekFrom::Start(id * PAGE_SIZE as u64))?;
@@ -56,12 +56,13 @@ impl PageManager for DiskBasedPageManager {
         }))
     }
 
-    fn write_page(&mut self, page: Box<dyn PageAccessor>) -> std::io::Result<()> {
+    fn write_page(&mut self, page: Box<dyn PageAccessor>) -> Result<()> {
         self.write_page_nosync(page)?;
-        self.file.sync_data()
+        self.file.sync_data()?;
+        Ok(())
     }
 
-    fn alloc_page(&mut self) -> std::io::Result<PageId> {
+    fn alloc_page(&mut self) -> Result<PageId> {
         let mut header = self.read_header_page()?;
         if header.free_page_id == 0 {
             self.append_free_pages(header.num_pages)?;
@@ -75,10 +76,10 @@ impl PageManager for DiskBasedPageManager {
         Ok(free_page_id)
     }
 
-    fn free_page(&mut self, id: PageId) -> std::io::Result<()> {
+    fn free_page(&mut self, id: PageId) -> Result<()> {
         let mut header = self.read_header_page()?;
         if id > header.num_pages {
-            panic!("Invalid id is used");
+            return Err(PageManagerError::InvalidPageId(id));
         }
         let page = FreePage { next_free_page_id: header.free_page_id };
         header.free_page_id = id;
@@ -89,27 +90,23 @@ impl PageManager for DiskBasedPageManager {
 }
 
 impl DiskBasedPageManager {
-    pub fn new(path: &Path) -> std::io::Result<Self> {
+    pub fn new(path: &Path) -> Result<Self> {
         if path.exists() {
             let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
             Ok(Self { file })
         } else {
-            match fs::OpenOptions::new().read(true).write(true).create(true).open(path)  {
-                Ok(file) => {
-                    let mut disk_manager = Self { file };
-                    disk_manager.write_header_page(HeaderPage {
-                        free_page_id: 0,
-                        num_pages: 0,
-                    })?;
-                    disk_manager.append_free_pages(DEFAULT_FILE_NUM_PAGES - 1)?;
-                    Ok(disk_manager)
-                },
-                Err(reason) => panic!("Couldn't create {} : {}", path.display(), reason)
-            }
+            let file = fs::OpenOptions::new().read(true).write(true).create(true).open(path)?;
+            let mut disk_manager = Self { file };
+            disk_manager.write_header_page(HeaderPage {
+                free_page_id: 0,
+                num_pages: 0,
+            })?;
+            disk_manager.append_free_pages(DEFAULT_FILE_NUM_PAGES - 1)?;
+            Ok(disk_manager)
         }
     }
 
-    fn append_free_pages(&mut self, num_pages: u64) -> std::io::Result<()> {
+    fn append_free_pages(&mut self, num_pages: u64) -> Result<()> {
         let mut header = self.read_header_page()?;
         let mut buffer = [0; PAGE_SIZE];
         let mut page = FreePage { next_free_page_id: 0 };
@@ -128,31 +125,32 @@ impl DiskBasedPageManager {
         self.write_header_page(header)
     }
 
-    fn read_header_page(&mut self) -> std::io::Result<HeaderPage> {
+    fn read_header_page(&mut self) -> Result<HeaderPage> {
         let mut buffer = vec![0u8; PAGE_SIZE];
         self.file.rewind()?;
         self.file.read_exact(buffer.as_mut_slice())?;
         Ok(bincode::deserialize(&buffer).unwrap())
     }
 
-    fn write_header_page(&mut self, header: HeaderPage) -> std::io::Result<()> {
+    fn write_header_page(&mut self, header: HeaderPage) -> Result<()> {
         self.write_header_page_nosync(header)?;
-        self.file.sync_data()
+        self.file.sync_data()?;
+        Ok(())
     }
 
-    fn write_header_page_nosync(&mut self, header: HeaderPage) -> std::io::Result<usize> {
+    fn write_header_page_nosync(&mut self, header: HeaderPage) -> Result<usize> {
         let mut buffer = [0u8; PAGE_SIZE];
         bincode::serialize_into(&mut buffer.as_mut_slice(), &header).unwrap();
         self.file.rewind()?;
-        self.file.write(&buffer)
+        Ok(self.file.write(&buffer)?)
     }
 
-    fn write_page_nosync(&mut self, page: Box<dyn PageAccessor>) -> std::io::Result<usize> {
+    fn write_page_nosync(&mut self, page: Box<dyn PageAccessor>) -> Result<usize> {
         if page.id() > self.read_header_page()?.num_pages {
-            panic!("Invalid id is used");
+            return Err(PageManagerError::InvalidPageId(page.id()));
         }
         self.file.seek(SeekFrom::Start(page.id() * PAGE_SIZE as u64))?;
-        self.file.write(&page.data())
+        Ok(self.file.write(&page.data())?)
     }
 }
 
