@@ -1,5 +1,4 @@
 use std::{fs::{File, self}, path::Path, io::{Write, Read, Seek, SeekFrom}, cell::RefCell};
-use serde_derive::{Serialize as SerializeDerive, Deserialize as DeserializeDerive};
 use bincode;
 #[allow(unused_imports)]
 use rand::Rng;
@@ -8,11 +7,6 @@ use super::*;
 pub const DEFAULT_FILE_SIZE: u64 = 1024*1024*10;
 pub const DEFAULT_FILE_NUM_PAGES: u64 = DEFAULT_FILE_SIZE / PAGE_SIZE as u64;
 
-#[derive(Clone, Default, SerializeDerive, DeserializeDerive)]
-struct HeaderPage {
-    free_page_id: PageId,
-    num_pages: u64,
-}
 
 #[derive(Clone, Default, SerializeDerive, DeserializeDerive)]
 struct FreePage {
@@ -43,6 +37,19 @@ impl PageAccessor for PageAccessorImpl {
 }
 
 impl PageManager for DiskBasedPageManager {
+    fn read_header_page(&mut self) -> Result<HeaderPage> {
+        let mut buffer = vec![0u8; PAGE_SIZE];
+        self.file.rewind()?;
+        self.file.read_exact(buffer.as_mut_slice())?;
+        Ok(bincode::deserialize(&buffer).unwrap())
+    }
+
+    fn write_header_page(&mut self, header: HeaderPage) -> Result<()> {
+        self.write_header_page_nosync(header)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     fn read_page(&mut self, id: PageId) -> Result<Box<dyn PageAccessor>> {
         if id > self.read_header_page()?.num_pages {
             return Err(PageManagerError::InvalidPageId(id));
@@ -123,19 +130,6 @@ impl DiskBasedPageManager {
         header.free_page_id = last_page_id;
         header.num_pages += num_pages;
         self.write_header_page(header)
-    }
-
-    fn read_header_page(&mut self) -> Result<HeaderPage> {
-        let mut buffer = vec![0u8; PAGE_SIZE];
-        self.file.rewind()?;
-        self.file.read_exact(buffer.as_mut_slice())?;
-        Ok(bincode::deserialize(&buffer).unwrap())
-    }
-
-    fn write_header_page(&mut self, header: HeaderPage) -> Result<()> {
-        self.write_header_page_nosync(header)?;
-        self.file.sync_data()?;
-        Ok(())
     }
 
     fn write_header_page_nosync(&mut self, header: HeaderPage) -> Result<usize> {

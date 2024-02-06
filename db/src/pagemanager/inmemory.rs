@@ -3,6 +3,7 @@ use super::*;
 
 pub struct InMemoryPageManager<T: PageManager> {
     page_manager: Box<T>,
+    header_page: HeaderPage,
     frame_map: HashMap<PageId, usize>,
     frames: Vec<PageFrame>,
     clock_hand: usize,
@@ -37,9 +38,11 @@ impl PageAccessor for PageAccessorImpl {
 }
 
 impl<P: PageManager> InMemoryPageManager<P> {
-    pub fn new(num_frames: usize, page_manager: P) -> Self {
+    pub fn new(num_frames: usize, mut page_manager: P) -> Self {
+        let header_page = page_manager.read_header_page().unwrap();
         Self { 
             page_manager: Box::new(page_manager),
+            header_page,
             frame_map: HashMap::new(),
             frames: vec![PageFrame {
                 page_id: 0,
@@ -98,6 +101,16 @@ impl<P: PageManager> InMemoryPageManager<P> {
 }
 
 impl<P: PageManager> PageManager for InMemoryPageManager<P> {
+    fn read_header_page(&mut self) -> Result<HeaderPage> {
+        Ok(self.header_page.clone())
+    }
+
+    fn write_header_page(&mut self, header: HeaderPage) -> Result<()> {
+        self.header_page = header.clone();
+        self.page_manager.write_header_page(header)?;
+        Ok(())
+    }
+
     fn read_page(&mut self, id: PageId) -> Result<Box<dyn PageAccessor>> {
         let frame = match self.get_frame(id) {
             Some(frame) => frame,
@@ -141,11 +154,15 @@ impl<P: PageManager> PageManager for InMemoryPageManager<P> {
     }
 
     fn alloc_page(&mut self) -> Result<PageId> {
-        self.page_manager.alloc_page()
+        let page_id = self.page_manager.alloc_page()?;
+        self.header_page = self.page_manager.read_header_page()?;
+        Ok(page_id)
     }
 
     fn free_page(&mut self, id: PageId) -> Result<()> {
-        self.page_manager.free_page(id)
+        self.page_manager.free_page(id)?;
+        self.header_page = self.page_manager.read_header_page()?;
+        Ok(())
     }
 }
 
