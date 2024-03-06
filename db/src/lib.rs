@@ -3,3 +3,5 @@ pub mod pagemanager;
 pub mod exceptions;
 pub use exceptions::Result;
 pub mod index;
+pub mod rand;
+pub mod bytes;

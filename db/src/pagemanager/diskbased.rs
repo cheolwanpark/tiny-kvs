@@ -1,7 +1,5 @@
 use std::{fs::{File, self}, path::Path, io::{Write, Read, Seek, SeekFrom}, cell::RefCell};
 use bincode;
-#[allow(unused_imports)]
-use rand::Rng;
 use super::*;
 
 pub const DEFAULT_FILE_SIZE: u64 = 1024*1024*10;
@@ -150,6 +148,8 @@ impl DiskBasedPageManager {
 
 #[cfg(test)]
 mod test {
+    use crate::rand::rand_bytes;
+
     use super::*;
 
     struct CleanupFileGuard<'a> {
@@ -209,8 +209,7 @@ mod test {
         let mut disk_manager = DiskBasedPageManager::new(&path).unwrap();
 
         let page_id = disk_manager.alloc_page().unwrap();
-        let mut rng = rand::thread_rng();
-        let data: Vec<u8> = (0..PAGE_SIZE).map(|_| rng.sample(rand::distributions::Alphanumeric) as u8).collect();
+        let data = rand_bytes(PAGE_SIZE);
         disk_manager.write_page(bytes_into_page(page_id, data.clone())).unwrap();
 
         let read_page = disk_manager.read_page(page_id).unwrap();
