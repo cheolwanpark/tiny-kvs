@@ -69,7 +69,7 @@ impl LeafPage {
             return Err(BPTreeError::ValueLengthError(value.len(), VALUE_LENGTH_LIMIT));
         }
         let data_size = key.len() + value.len();
-        let required_size = data_size + size_of::<KeyValueSlot>();
+        let required_size = data_size + KEY_VALUE_SLOT_SIZE;
         if required_size > self.header.freespace as usize {
             return Err(BPTreeError::NotEnoughSpaceError(required_size, self.header.freespace as usize));
         }
@@ -129,6 +129,62 @@ impl LeafPage {
         Ok(required_size)
     }
 
+    pub fn remove_record(&mut self, key: &str) -> Result<usize> {
+        // find deleting slot
+        let num_keys = self.header.page_header.num_keys;
+        let (removing_idx, removing_slot) = self.find_slot(key)?;
+
+        let removing_data_size = removing_slot.key_len + removing_slot.value_len;
+        let removing_size = removing_data_size as usize + KEY_VALUE_SLOT_SIZE;
+        let mut min_offset = SLOT_BUFFER_SIZE;
+
+        // update slots offset value and get min offset to shift data
+        for idx in (removing_idx+1)..num_keys {
+            let mut slot = self.get_slot(idx)?;
+            min_offset = slot.value_offset as usize;
+            slot.key_offset += removing_data_size;
+            slot.value_offset += removing_data_size;
+            self.set_slot(idx, slot)?;
+        }
+
+        // shift slots and data
+        let buffer = &mut self._slot_buffer.0;
+        buffer.copy_within(
+            (removing_idx+1) as usize*KEY_VALUE_SLOT_SIZE..num_keys as usize*KEY_VALUE_SLOT_SIZE,
+            removing_idx as usize*KEY_VALUE_SLOT_SIZE
+        );
+        buffer.copy_within(
+            min_offset..removing_slot.value_offset as usize,
+            min_offset + removing_data_size as usize
+        );
+
+        // update header values
+        self.header.page_header.num_keys -= 1;
+        self.header.freespace += removing_size as u32;
+
+        Ok(removing_size)
+    }
+
+    pub fn find_record(&self, key: &str) -> Result<String> {
+        let (_, slot) = self.find_slot(key)?;
+        let value_offset = slot.value_offset as usize;
+        let value_len = slot.value_len as usize;
+        let value = String::from_utf8(self._slot_buffer.0[value_offset..value_offset+value_len].to_vec())?;
+        Ok(value)
+    }
+
+    fn find_slot(&self, key: &str) -> Result<(u32, KeyValueSlot)> {
+        let num_keys = self.header.page_header.num_keys;
+        for idx in 0..num_keys {
+            let slot = self.get_slot(idx)?;
+            let slot_key = self.get_key(slot)?;
+            if slot_key == key {
+                return Ok((idx, slot));
+            }
+        }
+        Err(BPTreeError::KeyNotFoundError(key.to_string()))
+    }
+
     fn get_slot(&self, idx: u32) -> Result<KeyValueSlot> {
         if idx >= self.header.page_header.num_keys {
             return Err(BPTreeError::InvalidSlotIndexError(idx, self.header.page_header.num_keys));
@@ -159,12 +215,16 @@ impl LeafPage {
 }
 
 mod test {
-    use crate::rand::rand_string;
+    use std::collections::HashMap;
+
+    use crate::rand::{rand_string, rand_usize};
     use super::*;
 
     #[test]
     fn leaf_page_slot_test() {
         let mut page = LeafPage::new();
+        
+        // key, value length error checking
         assert!(matches!(
             page.insert_record(&rand_string(100), "value"), 
             Err(BPTreeError::KeyLengthError(_, _))
@@ -174,15 +234,18 @@ mod test {
             Err(BPTreeError::ValueLengthError(_, _))
         ));
         
+        // insertion phase 1
         let mut total_size: usize = 0;
         let buffer_size: usize = page._slot_buffer.0.len();
         const RAND_KEY_LEN: usize = 32;
         const RAND_VALUE_LEN: usize = 64;
         let single_slot_size = size_of::<KeyValueSlot>() + RAND_KEY_LEN + RAND_VALUE_LEN;
+        let mut records = HashMap::new();
         let mut keys = Vec::new();
         while total_size+single_slot_size < buffer_size {
             let key = format!("key_start__{}__key{:03}", rand_string(RAND_KEY_LEN-19), keys.len());
             let value = format!("value_start__{}__value{:03}", rand_string(RAND_VALUE_LEN-23), keys.len());
+            records.insert(key.clone(), value.clone());
             keys.push(key.clone());
             let inserted_size = page.insert_record(&key, &value).unwrap();
             total_size += inserted_size;
@@ -196,7 +259,66 @@ mod test {
             let key = page.get_key(page.get_slot(i).unwrap()).unwrap();
             let next_key = page.get_key(page.get_slot(i+1).unwrap()).unwrap();
             assert!(key <= next_key, "key: {}, next_key: {}", key, next_key);
-            assert!(key == keys[i as usize], "key: {}, keys[i]: {}", key, keys[i as usize]);
+            assert_eq!(key, keys[i as usize]);
+            let value = page.find_record(&key).unwrap();
+            assert_eq!(value, records[&key]);
         }
+        let key = page.get_key(page.get_slot(page.header.page_header.num_keys-1).unwrap()).unwrap();
+        let value = page.find_record(&key).unwrap();
+        assert_eq!(key, keys.last().unwrap().clone());
+        assert_eq!(value, records[&key]);
+
+        // deletion phase
+        const DELETING_N: usize = 10;
+        let mut deleted_keys = Vec::new();
+        for _ in 0..DELETING_N {
+            let idx = rand_usize(0, keys.len());
+            let key = keys.remove(idx);
+            records.remove(&key);
+            page.remove_record(&key).unwrap();
+            deleted_keys.push(key);
+        }
+        for i in 0..page.header.page_header.num_keys-1 {
+            let key = page.get_key(page.get_slot(i).unwrap()).unwrap();
+            let next_key = page.get_key(page.get_slot(i+1).unwrap()).unwrap();
+            assert!(key <= next_key, "key: {}, next_key: {}", key, next_key);
+            assert_eq!(key, keys[i as usize]);
+            let value = page.find_record(&key).unwrap();
+            assert_eq!(value, records[&key]);
+        }
+        let key = page.get_key(page.get_slot(page.header.page_header.num_keys-1).unwrap()).unwrap();
+        let value = page.find_record(&key).unwrap();
+        assert_eq!(key, keys.last().unwrap().clone());
+        assert_eq!(value, records[&key]);
+
+        for key in deleted_keys {
+            assert!(matches!(
+                page.find_record(&key), 
+                Err(BPTreeError::KeyNotFoundError(_))
+            ));
+        }
+
+        // insertion phase 2
+        for i in 0..DELETING_N {
+            let key = format!("key_start__{}__del{:03}", rand_string(RAND_KEY_LEN-19), i);
+            let value = format!("value_start__{}__del{:03}", rand_string(RAND_VALUE_LEN-21), i);
+            records.insert(key.clone(), value.clone());
+            keys.push(key.clone());
+            page.insert_record(&key, &value).unwrap();
+        }
+        keys.sort();
+        for i in 0..page.header.page_header.num_keys-1 {
+            let key = page.get_key(page.get_slot(i).unwrap()).unwrap();
+            let next_key = page.get_key(page.get_slot(i+1).unwrap()).unwrap();
+            assert!(key <= next_key, "key: {}, next_key: {}", key, next_key);
+            assert_eq!(key, keys[i as usize]);
+            let value = page.find_record(&key).unwrap();
+            assert_eq!(value, records[&key]);
+        }
+        let key = page.get_key(page.get_slot(page.header.page_header.num_keys-1).unwrap()).unwrap();
+        let value = page.find_record(&key).unwrap();
+        assert_eq!(key, keys.last().unwrap().clone());
+        assert_eq!(value, records[&key]);
+
     }
 }

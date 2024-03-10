@@ -35,6 +35,6 @@ mod test {
 
     #[test]
     fn internal_page_slot_test() {
-        let page = InternalPage::new();
+        
     }
 }

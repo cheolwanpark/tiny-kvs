@@ -15,4 +15,6 @@ pub enum BPTreeError {
     InvalidSlotIndexError(u32, u32),
     #[error("can't convert bytes into utf8 string, {0}")]
     Utf8ConvertError(#[from] FromUtf8Error),
+    #[error("Key {0} not found")]
+    KeyNotFoundError(String),
 }
