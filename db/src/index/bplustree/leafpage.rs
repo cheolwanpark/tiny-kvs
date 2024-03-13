@@ -61,6 +61,15 @@ impl LeafPage {
         self.header.right_sibling_id
     }
 
+    pub fn can_insert_record(&self, key: &str, value: &str) -> bool {
+        if key.len() > KEY_LENGTH_LIMIT || value.len() > VALUE_LENGTH_LIMIT {
+            return false;
+        }
+        let data_size = key.len() + value.len();
+        let required_size = data_size + KEY_VALUE_SLOT_SIZE;
+        required_size <= self.header.freespace as usize
+    }
+
     pub fn insert_record(&mut self, key: &str, value: &str) -> Result<usize> {
         if key.len() > KEY_LENGTH_LIMIT {
             return Err(BPTreeError::KeyLengthError(key.len(), KEY_LENGTH_LIMIT));
@@ -136,7 +145,7 @@ impl LeafPage {
 
         let removing_data_size = removing_slot.key_len + removing_slot.value_len;
         let removing_size = removing_data_size as usize + KEY_VALUE_SLOT_SIZE;
-        let mut min_offset = SLOT_BUFFER_SIZE;
+        let mut min_offset = removing_slot.value_offset as usize;
 
         // update slots offset value and get min offset to shift data
         for idx in (removing_idx+1)..num_keys {
@@ -171,6 +180,50 @@ impl LeafPage {
         let value_len = slot.value_len as usize;
         let value = String::from_utf8(self._slot_buffer.0[value_offset..value_offset+value_len].to_vec())?;
         Ok(value)
+    }
+
+    // split page into two pages, returned page is the right page
+    pub fn split(&mut self) -> Result<(String, LeafPage)> {
+        // find split index
+        let num_keys = self.header.page_header.num_keys;
+        let mut total_size = 0;
+        let mut split_idx = 0;
+        while total_size < SLOT_BUFFER_SIZE/2 && split_idx < num_keys{
+            let slot = self.get_slot(split_idx)?;
+            total_size += KEY_VALUE_SLOT_SIZE + slot.key_len as usize + slot.value_len as usize;
+            split_idx += 1;
+        }
+        split_idx -= 1;
+        let split_key = self.get_key(self.get_slot(split_idx)?)?;
+        
+        // create right page
+        let mut right_page = LeafPage::new();
+        right_page.header.page_header.num_keys = num_keys - split_idx;
+
+        // fill right page with slots and data
+        let mut offset = SLOT_BUFFER_SIZE as u16;
+        let mut min_orig_offset = SLOT_BUFFER_SIZE;
+        let mut data_len = 0;
+        for idx in split_idx..num_keys {
+            let mut slot = self.get_slot(idx)?;
+            min_orig_offset = slot.value_offset as usize;
+            slot.key_offset = offset - slot.key_len;
+            slot.value_offset = slot.key_offset - slot.value_len;
+            offset = slot.value_offset;
+            data_len += slot.key_len as usize + slot.value_len as usize;
+            right_page.set_slot(idx-split_idx, slot)?;
+        }
+        let orig_buffer = &self._slot_buffer.0;
+        let new_buffer = &mut right_page._slot_buffer.0;
+        new_buffer[offset as usize..].copy_from_slice(&orig_buffer[min_orig_offset..min_orig_offset+data_len]);
+        
+        // update header values
+        let total_len = data_len + (num_keys-split_idx) as usize*KEY_VALUE_SLOT_SIZE;
+        self.header.page_header.num_keys = split_idx;
+        self.header.freespace += total_len as u32;
+        right_page.header.freespace = SLOT_BUFFER_SIZE as u32 - total_len as u32;
+
+        Ok((split_key, right_page))
     }
 
     fn find_slot(&self, key: &str) -> Result<(u32, KeyValueSlot)> {
@@ -255,18 +308,12 @@ mod test {
             Err(BPTreeError::NotEnoughSpaceError(_, _))
         ));
         keys.sort();
-        for i in 0..page.header.page_header.num_keys-1 {
+        for i in 0..page.header.page_header.num_keys {
             let key = page.get_key(page.get_slot(i).unwrap()).unwrap();
-            let next_key = page.get_key(page.get_slot(i+1).unwrap()).unwrap();
-            assert!(key <= next_key, "key: {}, next_key: {}", key, next_key);
-            assert_eq!(key, keys[i as usize]);
             let value = page.find_record(&key).unwrap();
+            assert_eq!(key, keys[i as usize]);
             assert_eq!(value, records[&key]);
         }
-        let key = page.get_key(page.get_slot(page.header.page_header.num_keys-1).unwrap()).unwrap();
-        let value = page.find_record(&key).unwrap();
-        assert_eq!(key, keys.last().unwrap().clone());
-        assert_eq!(value, records[&key]);
 
         // deletion phase
         const DELETING_N: usize = 10;
@@ -278,18 +325,13 @@ mod test {
             page.remove_record(&key).unwrap();
             deleted_keys.push(key);
         }
-        for i in 0..page.header.page_header.num_keys-1 {
+        keys.sort();
+        for i in 0..page.header.page_header.num_keys {
             let key = page.get_key(page.get_slot(i).unwrap()).unwrap();
-            let next_key = page.get_key(page.get_slot(i+1).unwrap()).unwrap();
-            assert!(key <= next_key, "key: {}, next_key: {}", key, next_key);
-            assert_eq!(key, keys[i as usize]);
             let value = page.find_record(&key).unwrap();
+            assert_eq!(key, keys[i as usize]);
             assert_eq!(value, records[&key]);
         }
-        let key = page.get_key(page.get_slot(page.header.page_header.num_keys-1).unwrap()).unwrap();
-        let value = page.find_record(&key).unwrap();
-        assert_eq!(key, keys.last().unwrap().clone());
-        assert_eq!(value, records[&key]);
 
         for key in deleted_keys {
             assert!(matches!(
@@ -307,18 +349,53 @@ mod test {
             page.insert_record(&key, &value).unwrap();
         }
         keys.sort();
-        for i in 0..page.header.page_header.num_keys-1 {
+        for i in 0..page.header.page_header.num_keys {
             let key = page.get_key(page.get_slot(i).unwrap()).unwrap();
-            let next_key = page.get_key(page.get_slot(i+1).unwrap()).unwrap();
-            assert!(key <= next_key, "key: {}, next_key: {}", key, next_key);
-            assert_eq!(key, keys[i as usize]);
             let value = page.find_record(&key).unwrap();
+            assert_eq!(key, keys[i as usize]);
             assert_eq!(value, records[&key]);
         }
-        let key = page.get_key(page.get_slot(page.header.page_header.num_keys-1).unwrap()).unwrap();
-        let value = page.find_record(&key).unwrap();
-        assert_eq!(key, keys.last().unwrap().clone());
-        assert_eq!(value, records[&key]);
+    }
 
+    #[test]
+    fn leaf_page_split_test() {
+        let mut page = LeafPage::new();
+        
+        // insertion
+        let mut total_size: usize = 0;
+        let buffer_size: usize = page._slot_buffer.0.len();
+        const RAND_KEY_LEN: usize = 32;
+        const RAND_VALUE_LEN: usize = 64;
+        let single_slot_size = size_of::<KeyValueSlot>() + RAND_KEY_LEN + RAND_VALUE_LEN;
+        let mut records = HashMap::new();
+        let mut keys = Vec::new();
+        while total_size+single_slot_size < buffer_size {
+            let key = format!("key_start__{}__key{:03}", rand_string(RAND_KEY_LEN-19), keys.len());
+            let value = format!("value_start__{}__value{:03}", rand_string(RAND_VALUE_LEN-23), keys.len());
+            records.insert(key.clone(), value.clone());
+            keys.push(key.clone());
+            let inserted_size = page.insert_record(&key, &value).unwrap();
+            total_size += inserted_size;
+        }
+        assert!(!page.can_insert_record(&rand_string(RAND_KEY_LEN), &rand_string(RAND_VALUE_LEN)));
+        keys.sort();
+        
+        // split and check validity
+        let (split_key, right_page) = page.split().unwrap();
+        let left_num_keys = page.header.page_header.num_keys;
+        let right_num_keys = right_page.header.page_header.num_keys;
+        assert_eq!(split_key, right_page.get_key(right_page.get_slot(0).unwrap()).unwrap());
+        for i in 0..left_num_keys {
+            let key = page.get_key(page.get_slot(i).unwrap()).unwrap();
+            let value = page.find_record(&key).unwrap();
+            assert_eq!(key, keys[i as usize]);
+            assert_eq!(value, records[&key]);
+        }
+        for i in 0..right_num_keys {
+            let key = right_page.get_key(right_page.get_slot(i).unwrap()).unwrap();
+            let value = right_page.find_record(&key).unwrap();
+            assert_eq!(key, keys[(i+left_num_keys) as usize]);
+            assert_eq!(value, records[&key]);
+        }
     }
 }
